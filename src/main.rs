@@ -138,13 +138,6 @@ struct RegisterPeerRequest {
     url: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PeerPingRequest {
-    #[serde(default)]
-    message: Option<String>,
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MeshNodeResponse {
@@ -437,7 +430,6 @@ async fn register_mesh_peer(
 async fn ping_mesh_peer(
     State(state): State<Arc<AppState>>,
     Path(peer_id): Path<String>,
-    Json(req): Json<PeerPingRequest>,
 ) -> Result<Json<MeshPeerResponse>, (StatusCode, Json<serde_json::Value>)> {
     let peer = {
         let peers = state.mesh_peers.read().await;
@@ -452,9 +444,7 @@ async fn ping_mesh_peer(
 
     let started = Instant::now();
     let url = peer.url.clone();
-    let message = req
-        .message
-        .unwrap_or_else(|| format!("mesh ping from {}", state.node_id));
+    let message = format!("mesh ping from {}", state.node_id);
     let result = tokio::task::spawn_blocking(move || {
         post_peer_ping(&url, &serde_json::json!({ "message": message }).to_string())
     })
