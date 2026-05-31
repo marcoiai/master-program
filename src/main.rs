@@ -359,6 +359,29 @@ fn started_at_rfc3339(value: OffsetDateTime) -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
+fn emit_ping_signal(
+    state: &AppState,
+    kind: &'static str,
+    peer_id: Option<&str>,
+    payload: serde_json::Value,
+) {
+    let env = Envelope {
+        version: "1".to_string(),
+        kind: kind.to_string(),
+        request_id: Uuid::new_v4(),
+        timestamp: now_rfc3339(),
+        source: "master-program".to_string(),
+        capability: "core.ping".to_string(),
+        payload: serde_json::json!({
+            "peerId": peer_id,
+            "signal": kind,
+            "detail": payload,
+        }),
+    };
+
+    let _ = state.events_tx.send(env);
+}
+
 fn base_capabilities() -> Vec<Capability> {
     vec![
         Capability {
@@ -593,12 +616,27 @@ async fn connect_mesh_peer(
         })?;
 
     let (peer, reachable) = if req.ping {
+        emit_ping_signal(
+            state.as_ref(),
+            "core.ping.sent",
+            Some(&peer_id),
+            serde_json::json!({ "url": req.url }),
+        );
         let outcome = state.mesh.ping_peer(&peer_id).map_err(|error| {
             (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({ "error": "peer_ping_failed", "detail": error })),
             )
         })?;
+        emit_ping_signal(
+            state.as_ref(),
+            "core.ping.confirmed",
+            Some(&peer_id),
+            serde_json::json!({
+                "url": req.url,
+                "latencyMs": outcome.peer.latency_ms,
+            }),
+        );
         (outcome.peer, true)
     } else {
         (peer, false)
@@ -618,6 +656,12 @@ async fn ping_mesh_peer(
     State(state): State<Arc<AppState>>,
     Path(peer_id): Path<String>,
 ) -> Result<Json<MeshPeerResponse>, (StatusCode, Json<serde_json::Value>)> {
+    emit_ping_signal(
+        state.as_ref(),
+        "core.ping.sent",
+        Some(&peer_id),
+        serde_json::json!({}),
+    );
     let outcome = state.mesh.ping_peer(&peer_id).map_err(|error| {
         let status = if error == "peer_not_found" {
             StatusCode::NOT_FOUND
@@ -630,6 +674,15 @@ async fn ping_mesh_peer(
         };
         (status, Json(serde_json::json!({ "error": error })))
     })?;
+    emit_ping_signal(
+        state.as_ref(),
+        "core.ping.confirmed",
+        Some(&peer_id),
+        serde_json::json!({
+            "latencyMs": outcome.peer.latency_ms,
+            "transport": outcome.peer.last_transport,
+        }),
+    );
     let node = state.mesh.node();
 
     Ok(Json(MeshPeerResponse {
@@ -860,8 +913,8 @@ async fn events(
             match rx.recv().await {
                 Ok(envelope) => {
                     if let Ok(json) = serde_json::to_string(&envelope) {
-                        let evt = if envelope.kind == "core.ping.received" {
-                            Event::default().event("core.ping.received").data(json)
+                        let evt = if envelope.kind.starts_with("core.ping.") {
+                            Event::default().event(envelope.kind.clone()).data(json)
                         } else if envelope.kind == "scene.state.updated" {
                             Event::default().event("scene.state.updated").data(json)
                         } else {
