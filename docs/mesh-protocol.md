@@ -217,6 +217,7 @@ Existing routes remain:
 - `POST /v1/ping`
 - `GET /v1/mesh/node`
 - `GET /v1/mesh/peers`
+- `POST /v1/mesh/connect`
 - `POST /v1/mesh/peers/register`
 - `POST /v1/mesh/peers/{id}/ping`
 - `GET /v1/scene-state`
@@ -228,6 +229,32 @@ New additive routes:
 - `POST /v1/mesh/envelope`
 - `POST /v1/scene-layers`
 - `DELETE /v1/scene-layers/{id}`
+
+### Manual Node Connect
+
+Any node can receive connections when it is listening on a reachable interface:
+
+```bash
+MASTER_PROGRAM_HOST=0.0.0.0 cargo run
+```
+
+Another node can connect to it with:
+
+```bash
+curl -X POST http://127.0.0.1:17321/v1/mesh/connect \
+  -H 'Content-Type: application/json' \
+  -d '{ "url": "http://192.168.100.7:17321" }'
+```
+
+The local node will:
+
+1. fetch the remote `/v1/mesh/node`,
+2. register the remote node as a peer,
+3. ping the remote node to prove reachability,
+4. return the stored peer plus `reachable`.
+
+This is the current v0 flow for LAN and hotspot mode. It is manual by design:
+there is no central server requirement and no automatic radio discovery yet.
 
 ## Limitations
 
@@ -250,6 +277,7 @@ cargo check
 Manual checks:
 
 - Existing peer registration with `{ "id", "url" }` still works.
+- `POST /v1/mesh/connect` registers a reachable remote node by URL.
 - `POST /v1/mesh/peers/{id}/ping` still uses HTTP for HTTP peers.
 - Registering a non-HTTP peer returns clear unavailable transport behavior.
 - `GET /v1/scene-state` includes `layers` and keeps old ambience/object fields.

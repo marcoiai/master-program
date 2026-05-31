@@ -9,7 +9,7 @@ use axum::{
 };
 use futures_util::Stream;
 mod mesh;
-use mesh::transports::local_http::{LocalHttpTransport, parse_http_url};
+use mesh::transports::local_http::{LocalHttpTransport, get_peer_json, parse_http_url};
 use mesh::transports::stubs::StubTransport;
 use mesh::{MeshEngine, SceneLayer, SceneLayerPatch};
 use serde::{Deserialize, Serialize};
@@ -127,6 +127,8 @@ struct MeshNodeResponse {
     ok: bool,
     node_id: String,
     started_at: String,
+    node: mesh::identity::NodeIdentity,
+    transports: Vec<mesh::engine::MeshTransportStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,6 +145,44 @@ struct MeshPeerResponse {
     ok: bool,
     node_id: String,
     peer: mesh::MeshPeer,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MeshConnectRequest {
+    url: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default = "default_connect_ping")]
+    ping: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MeshConnectResponse {
+    ok: bool,
+    node_id: String,
+    peer: mesh::MeshPeer,
+    reachable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_started_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteMeshNodeResponse {
+    ok: bool,
+    node_id: String,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    node: Option<mesh::identity::NodeIdentity>,
+}
+
+fn default_connect_ping() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,6 +392,11 @@ fn base_capabilities() -> Vec<Capability> {
             description: "Prototype mesh peer registry and remote ping.",
         },
         Capability {
+            id: "mesh.connect",
+            version: "0",
+            description: "Manual node-to-node connection handshake over an available transport.",
+        },
+        Capability {
             id: "mesh.protocol",
             version: "0",
             description: "Versioned local-first mesh protocol envelope and router.",
@@ -416,8 +461,10 @@ async fn mesh_node(State(state): State<Arc<AppState>>) -> Json<MeshNodeResponse>
     let node = state.mesh.node();
     Json(MeshNodeResponse {
         ok: true,
-        node_id: node.node_id,
+        node_id: node.node_id.clone(),
         started_at: started_at_rfc3339(state.started_at),
+        node,
+        transports: state.mesh.transport_statuses(),
     })
 }
 
@@ -460,6 +507,110 @@ async fn register_mesh_peer(
         ok: true,
         node_id: node.node_id,
         peer: mesh::MeshPeer::from(peer),
+    }))
+}
+
+async fn connect_mesh_peer(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<MeshConnectRequest>,
+) -> Result<Json<MeshConnectResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let url = req.url.trim().trim_end_matches('/').to_string();
+    if url.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "peer_url_required" })),
+        ));
+    }
+    if parse_http_url(&url).is_err() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "peer_url_must_be_http_url" })),
+        ));
+    }
+
+    let remote_value = get_peer_json(&url, "/v1/mesh/node").map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": "peer_node_unreachable", "detail": error })),
+        )
+    })?;
+    let remote: RemoteMeshNodeResponse = serde_json::from_value(remote_value).map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": "peer_node_invalid", "detail": error.to_string() })),
+        )
+    })?;
+    if !remote.ok {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": "peer_node_not_ok" })),
+        ));
+    }
+
+    let remote_node = remote.node;
+    let peer_id = req
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| remote.node_id.clone());
+    let display_name = req.display_name.or_else(|| {
+        remote_node
+            .as_ref()
+            .and_then(|node| node.display_name.clone())
+    });
+
+    let peer = state
+        .mesh
+        .register_peer_request(mesh::RegisterPeerRequest {
+            id: peer_id.clone(),
+            role: remote_node.as_ref().map(|node| node.role.clone()),
+            url: Some(url),
+            display_name,
+            transport: Some("local_http".to_string()),
+            transports: vec![],
+            capabilities: remote_node
+                .as_ref()
+                .map(|node| node.capabilities.clone())
+                .unwrap_or_else(|| vec!["mesh.control".to_string(), "core.ping".to_string()]),
+            transmission_profile: remote_node
+                .as_ref()
+                .and_then(|node| node.transmission_profile.clone()),
+            connectivity_policy: remote_node
+                .as_ref()
+                .map(|node| node.connectivity_policy.clone()),
+            metadata: serde_json::json!({
+                "connectedVia": "manual_http",
+                "remoteNodeId": remote.node_id,
+            }),
+        })
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": error })),
+            )
+        })?;
+
+    let (peer, reachable) = if req.ping {
+        let outcome = state.mesh.ping_peer(&peer_id).map_err(|error| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "peer_ping_failed", "detail": error })),
+            )
+        })?;
+        (outcome.peer, true)
+    } else {
+        (peer, false)
+    };
+    let node = state.mesh.node();
+
+    Ok(Json(MeshConnectResponse {
+        ok: true,
+        node_id: node.node_id,
+        peer: mesh::MeshPeer::from(peer),
+        reachable,
+        remote_started_at: remote.started_at,
     }))
 }
 
@@ -785,6 +936,7 @@ async fn main() {
         .route("/v1/ping", post(ping))
         .route("/v1/mesh/node", get(mesh_node))
         .route("/v1/mesh/peers", get(list_mesh_peers))
+        .route("/v1/mesh/connect", post(connect_mesh_peer))
         .route("/v1/mesh/peers/register", post(register_mesh_peer))
         .route("/v1/mesh/peers/{id}/ping", post(ping_mesh_peer))
         .route("/v1/mesh/envelope", post(receive_mesh_envelope))
