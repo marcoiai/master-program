@@ -58,6 +58,7 @@ struct HealthResponse {
     name: &'static str,
     version: &'static str,
     started_at: String,
+    realtime: RealtimeTransport,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,6 +66,7 @@ struct HealthResponse {
 struct CapabilitiesResponse {
     ok: bool,
     capabilities: Vec<Capability>,
+    realtime: RealtimeTransport,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,6 +75,16 @@ struct Capability {
     id: &'static str,
     version: &'static str,
     description: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RealtimeTransport {
+    kind: &'static str,
+    websocket_path: &'static str,
+    port: u16,
+    room: &'static str,
+    domain: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -430,11 +442,29 @@ fn base_capabilities() -> Vec<Capability> {
             description: "Text stream sessions with ACK/NACK, backpressure, and error control.",
         },
         Capability {
+            id: "realtime.xmpp",
+            version: "0",
+            description: "Local XMPP websocket companion transport for nearby chat.",
+        },
+        Capability {
             id: "scene.layers",
             version: "0",
             description: "Dynamic scene layers for media embeds, effects, artwork, and data panels.",
         },
     ]
+}
+
+fn realtime_transport() -> RealtimeTransport {
+    RealtimeTransport {
+        kind: "xmpp",
+        websocket_path: "/xmpp-websocket",
+        port: std::env::var("MASTER_PROGRAM_XMPP_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(5280),
+        room: "levelup@conference.localhost",
+        domain: "localhost",
+    }
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
@@ -443,6 +473,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
         name: "master-program",
         version: env!("CARGO_PKG_VERSION"),
         started_at: started_at_rfc3339(state.started_at),
+        realtime: realtime_transport(),
     })
 }
 
@@ -450,6 +481,7 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
     Json(CapabilitiesResponse {
         ok: true,
         capabilities: base_capabilities(),
+        realtime: realtime_transport(),
     })
 }
 
