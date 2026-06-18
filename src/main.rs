@@ -5,21 +5,18 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     response::{Html, IntoResponse},
-    routing::{delete, get, post},
+    routing::{get, post},
 };
 use futures_util::Stream;
-mod mesh;
-use mesh::transports::local_http::{LocalHttpTransport, get_peer_json, parse_http_url};
-use mesh::transports::stubs::StubTransport;
-use mesh::{MeshEngine, SceneLayer, SceneLayerPatch};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     convert::Infallible,
+    io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path as FsPath, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
@@ -33,8 +30,9 @@ use uuid::Uuid;
 struct AppState {
     events_tx: broadcast::Sender<Envelope>,
     started_at: OffsetDateTime,
-    mesh: MeshEngine,
+    node_id: String,
     apps: RwLock<HashMap<String, RegisteredApp>>,
+    mesh_peers: RwLock<HashMap<String, MeshPeer>>,
     scene_state: RwLock<SceneStateModel>,
 }
 
@@ -58,7 +56,6 @@ struct HealthResponse {
     name: &'static str,
     version: &'static str,
     started_at: String,
-    realtime: RealtimeTransport,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,7 +63,6 @@ struct HealthResponse {
 struct CapabilitiesResponse {
     ok: bool,
     capabilities: Vec<Capability>,
-    realtime: RealtimeTransport,
 }
 
 #[derive(Debug, Serialize)]
@@ -75,16 +71,6 @@ struct Capability {
     id: &'static str,
     version: &'static str,
     description: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RealtimeTransport {
-    kind: &'static str,
-    websocket_path: &'static str,
-    port: u16,
-    room: &'static str,
-    domain: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,14 +119,31 @@ struct PingResponse {
     request_id: Uuid,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MeshPeer {
+    id: String,
+    url: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_seen: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latency_ms: Option<u128>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegisterPeerRequest {
+    id: String,
+    url: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MeshNodeResponse {
     ok: bool,
     node_id: String,
     started_at: String,
-    node: mesh::identity::NodeIdentity,
-    transports: Vec<mesh::engine::MeshTransportStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -148,7 +151,7 @@ struct MeshNodeResponse {
 struct MeshPeersResponse {
     ok: bool,
     node_id: String,
-    peers: Vec<mesh::MeshPeer>,
+    peers: Vec<MeshPeer>,
 }
 
 #[derive(Debug, Serialize)]
@@ -156,45 +159,7 @@ struct MeshPeersResponse {
 struct MeshPeerResponse {
     ok: bool,
     node_id: String,
-    peer: mesh::MeshPeer,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MeshConnectRequest {
-    url: String,
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    display_name: Option<String>,
-    #[serde(default = "default_connect_ping")]
-    ping: bool,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MeshConnectResponse {
-    ok: bool,
-    node_id: String,
-    peer: mesh::MeshPeer,
-    reachable: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    remote_started_at: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RemoteMeshNodeResponse {
-    ok: bool,
-    node_id: String,
-    #[serde(default)]
-    started_at: Option<String>,
-    #[serde(default)]
-    node: Option<mesh::identity::NodeIdentity>,
-}
-
-fn default_connect_ping() -> bool {
-    true
+    peer: MeshPeer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,8 +186,6 @@ struct SceneObjects {
 struct SceneStateModel {
     ambience: SceneAmbience,
     objects: SceneObjects,
-    #[serde(default)]
-    layers: Vec<SceneLayer>,
 }
 
 #[derive(Debug, Serialize)]
@@ -258,10 +221,6 @@ struct SceneStatePatch {
     ambience: SceneAmbiencePatch,
     #[serde(default)]
     objects: SceneObjectsPatch,
-    #[serde(default)]
-    layers: Option<Vec<SceneLayer>>,
-    #[serde(default)]
-    layer: Option<SceneLayerPatch>,
 }
 
 impl Default for SceneStateModel {
@@ -280,7 +239,6 @@ impl Default for SceneStateModel {
                 shelf_robot_signal: true,
                 blue_robot_pulse: true,
             },
-            layers: Vec::new(),
         }
     }
 }
@@ -318,44 +276,6 @@ impl SceneStateModel {
         if let Some(blue_robot_pulse) = patch.objects.blue_robot_pulse {
             self.objects.blue_robot_pulse = blue_robot_pulse;
         }
-
-        if let Some(layers) = patch.layers {
-            self.layers = layers;
-        }
-        if let Some(layer_patch) = patch.layer {
-            self.apply_layer_patch(layer_patch);
-        }
-    }
-
-    fn apply_layer_patch(&mut self, patch: SceneLayerPatch) {
-        let Some(layer_id) = patch.layer_id else {
-            return;
-        };
-        let Some(layer) = self
-            .layers
-            .iter_mut()
-            .find(|candidate| candidate.layer_id == layer_id)
-        else {
-            return;
-        };
-        if let Some(visible) = patch.visible {
-            layer.presentation.visible = visible;
-        }
-        if let Some(slot) = patch.slot {
-            layer.presentation.slot = slot;
-        }
-        if let Some(motion) = patch.motion {
-            layer.presentation.motion = motion;
-        }
-        if let Some(profile) = patch.profile {
-            layer.presentation.profile = profile;
-        }
-        if let Some(z_index) = patch.z_index {
-            layer.presentation.z_index = z_index;
-        }
-        if let Some(source) = patch.source {
-            layer.source = Some(source);
-        }
     }
 }
 
@@ -369,29 +289,6 @@ fn started_at_rfc3339(value: OffsetDateTime) -> String {
     value
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
-}
-
-fn emit_ping_signal(
-    state: &AppState,
-    kind: &'static str,
-    peer_id: Option<&str>,
-    payload: serde_json::Value,
-) {
-    let env = Envelope {
-        version: "1".to_string(),
-        kind: kind.to_string(),
-        request_id: Uuid::new_v4(),
-        timestamp: now_rfc3339(),
-        source: "master-program".to_string(),
-        capability: "core.ping".to_string(),
-        payload: serde_json::json!({
-            "peerId": peer_id,
-            "signal": kind,
-            "detail": payload,
-        }),
-    };
-
-    let _ = state.events_tx.send(env);
 }
 
 fn base_capabilities() -> Vec<Capability> {
@@ -426,54 +323,15 @@ fn base_capabilities() -> Vec<Capability> {
             version: "0",
             description: "Prototype mesh peer registry and remote ping.",
         },
-        Capability {
-            id: "mesh.connect",
-            version: "0",
-            description: "Manual node-to-node connection handshake over an available transport.",
-        },
-        Capability {
-            id: "mesh.protocol",
-            version: "0",
-            description: "Versioned local-first mesh protocol envelope and router.",
-        },
-        Capability {
-            id: "mesh.stream",
-            version: "0",
-            description: "Text stream sessions with ACK/NACK, backpressure, and error control.",
-        },
-        Capability {
-            id: "realtime.xmpp",
-            version: "0",
-            description: "Local XMPP websocket companion transport for nearby chat.",
-        },
-        Capability {
-            id: "scene.layers",
-            version: "0",
-            description: "Dynamic scene layers for media embeds, effects, artwork, and data panels.",
-        },
     ]
-}
-
-fn realtime_transport() -> RealtimeTransport {
-    RealtimeTransport {
-        kind: "xmpp",
-        websocket_path: "/xmpp-websocket",
-        port: std::env::var("MASTER_PROGRAM_XMPP_PORT")
-            .ok()
-            .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or(5280),
-        room: "levelup@conference.localhost",
-        domain: "localhost",
-    }
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     Json(HealthResponse {
         ok: true,
-        name: "master-program",
+        name: "master_program",
         version: env!("CARGO_PKG_VERSION"),
         started_at: started_at_rfc3339(state.started_at),
-        realtime: realtime_transport(),
     })
 }
 
@@ -481,7 +339,6 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
     Json(CapabilitiesResponse {
         ok: true,
         capabilities: base_capabilities(),
-        realtime: realtime_transport(),
     })
 }
 
@@ -499,7 +356,7 @@ async fn ping(
         kind: "core.ping.received".to_string(),
         request_id,
         timestamp: now_rfc3339(),
-        source: "master-program".to_string(),
+        source: "master_program".to_string(),
         capability: "core.ping".to_string(),
         payload,
     };
@@ -513,174 +370,60 @@ async fn ping(
 }
 
 async fn mesh_node(State(state): State<Arc<AppState>>) -> Json<MeshNodeResponse> {
-    let node = state.mesh.node();
     Json(MeshNodeResponse {
         ok: true,
-        node_id: node.node_id.clone(),
+        node_id: state.node_id.clone(),
         started_at: started_at_rfc3339(state.started_at),
-        node,
-        transports: state.mesh.transport_statuses(),
     })
 }
 
 async fn list_mesh_peers(State(state): State<Arc<AppState>>) -> Json<MeshPeersResponse> {
-    let node = state.mesh.node();
+    let peers = state.mesh_peers.read().await;
     Json(MeshPeersResponse {
         ok: true,
-        node_id: node.node_id,
-        peers: state.mesh.list_peers(),
+        node_id: state.node_id.clone(),
+        peers: peers.values().cloned().collect(),
     })
 }
 
 async fn register_mesh_peer(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<mesh::RegisterPeerRequest>,
+    Json(req): Json<RegisterPeerRequest>,
 ) -> Result<Json<MeshPeerResponse>, (StatusCode, Json<serde_json::Value>)> {
-    if let Some(url) = req
-        .url
-        .as_deref()
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-    {
-        if parse_http_url(url.trim_end_matches('/')).is_err() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "peer_url_must_be_http_url" })),
-            ));
-        }
-    }
+    let id = req.id.trim();
+    let url = req.url.trim().trim_end_matches('/');
 
-    let peer = state.mesh.register_peer_request(req).map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": error })),
-        )
-    })?;
-    let node = state.mesh.node();
-
-    Ok(Json(MeshPeerResponse {
-        ok: true,
-        node_id: node.node_id,
-        peer: mesh::MeshPeer::from(peer),
-    }))
-}
-
-async fn connect_mesh_peer(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<MeshConnectRequest>,
-) -> Result<Json<MeshConnectResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let url = req.url.trim().trim_end_matches('/').to_string();
-    if url.is_empty() {
+    if id.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "peer_url_required" })),
+            Json(serde_json::json!({ "error": "peer_id_required" })),
         ));
     }
-    if parse_http_url(&url).is_err() {
+
+    if parse_http_url(url).is_err() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "peer_url_must_be_http_url" })),
         ));
     }
 
-    let remote_value = get_peer_json(&url, "/v1/mesh/node").map_err(|error| {
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "error": "peer_node_unreachable", "detail": error })),
-        )
-    })?;
-    let remote: RemoteMeshNodeResponse = serde_json::from_value(remote_value).map_err(|error| {
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "error": "peer_node_invalid", "detail": error.to_string() })),
-        )
-    })?;
-    if !remote.ok {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "error": "peer_node_not_ok" })),
-        ));
+    let peer = MeshPeer {
+        id: id.to_string(),
+        url: url.to_string(),
+        status: "registered".to_string(),
+        last_seen: None,
+        latency_ms: None,
+    };
+
+    {
+        let mut peers = state.mesh_peers.write().await;
+        peers.insert(peer.id.clone(), peer.clone());
     }
 
-    let remote_node = remote.node;
-    let peer_id = req
-        .id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| remote.node_id.clone());
-    let display_name = req.display_name.or_else(|| {
-        remote_node
-            .as_ref()
-            .and_then(|node| node.display_name.clone())
-    });
-
-    let peer = state
-        .mesh
-        .register_peer_request(mesh::RegisterPeerRequest {
-            id: peer_id.clone(),
-            role: remote_node.as_ref().map(|node| node.role.clone()),
-            url: Some(url),
-            display_name,
-            transport: Some("local_http".to_string()),
-            transports: vec![],
-            capabilities: remote_node
-                .as_ref()
-                .map(|node| node.capabilities.clone())
-                .unwrap_or_else(|| vec!["mesh.control".to_string(), "core.ping".to_string()]),
-            transmission_profile: remote_node
-                .as_ref()
-                .and_then(|node| node.transmission_profile.clone()),
-            connectivity_policy: remote_node
-                .as_ref()
-                .map(|node| node.connectivity_policy.clone()),
-            metadata: serde_json::json!({
-                "connectedVia": "manual_http",
-                "remoteNodeId": remote.node_id,
-            }),
-        })
-        .map_err(|error| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": error })),
-            )
-        })?;
-
-    let (peer, reachable) = if req.ping {
-        emit_ping_signal(
-            state.as_ref(),
-            "core.ping.sent",
-            Some(&peer_id),
-            serde_json::json!({ "url": req.url }),
-        );
-        let outcome = state.mesh.ping_peer(&peer_id).map_err(|error| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": "peer_ping_failed", "detail": error })),
-            )
-        })?;
-        emit_ping_signal(
-            state.as_ref(),
-            "core.ping.confirmed",
-            Some(&peer_id),
-            serde_json::json!({
-                "url": req.url,
-                "latencyMs": outcome.peer.latency_ms,
-            }),
-        );
-        (outcome.peer, true)
-    } else {
-        (peer, false)
-    };
-    let node = state.mesh.node();
-
-    Ok(Json(MeshConnectResponse {
+    Ok(Json(MeshPeerResponse {
         ok: true,
-        node_id: node.node_id,
-        peer: mesh::MeshPeer::from(peer),
-        reachable,
-        remote_started_at: remote.started_at,
+        node_id: state.node_id.clone(),
+        peer,
     }))
 }
 
@@ -688,111 +431,111 @@ async fn ping_mesh_peer(
     State(state): State<Arc<AppState>>,
     Path(peer_id): Path<String>,
 ) -> Result<Json<MeshPeerResponse>, (StatusCode, Json<serde_json::Value>)> {
-    emit_ping_signal(
-        state.as_ref(),
-        "core.ping.sent",
-        Some(&peer_id),
-        serde_json::json!({}),
-    );
-    let outcome = state.mesh.ping_peer(&peer_id).map_err(|error| {
-        let status = if error == "peer_not_found" {
-            StatusCode::NOT_FOUND
-        } else if error == "peer_rate_limited" {
-            StatusCode::TOO_MANY_REQUESTS
-        } else if error == "peer_transport_unavailable" {
-            StatusCode::BAD_REQUEST
-        } else {
-            StatusCode::BAD_GATEWAY
-        };
-        (status, Json(serde_json::json!({ "error": error })))
-    })?;
-    emit_ping_signal(
-        state.as_ref(),
-        "core.ping.confirmed",
-        Some(&peer_id),
-        serde_json::json!({
-            "latencyMs": outcome.peer.latency_ms,
-            "transport": outcome.peer.last_transport,
-        }),
-    );
-    let node = state.mesh.node();
-
-    Ok(Json(MeshPeerResponse {
-        ok: outcome.ok,
-        node_id: node.node_id,
-        peer: mesh::MeshPeer::from(outcome.peer),
-    }))
-}
-
-async fn receive_mesh_envelope(
-    State(state): State<Arc<AppState>>,
-    Json(envelope): Json<mesh::envelope::ProtocolEnvelope>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let accepted = state.mesh.receive(envelope).map_err(|error| {
-        let status = match error.as_str() {
-            "peer_rate_limited" => StatusCode::TOO_MANY_REQUESTS,
-            "payload_too_large" | "invalid_envelope" | "unsupported_protocol_version" => {
-                StatusCode::BAD_REQUEST
-            }
-            _ => StatusCode::BAD_GATEWAY,
-        };
-        (status, Json(serde_json::json!({ "error": error })))
+    let peer = {
+        let peers = state.mesh_peers.read().await;
+        peers.get(&peer_id).cloned()
+    }
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "peer_not_found" })),
+        )
     })?;
 
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "accepted": accepted,
-    })))
-}
+    let started = Instant::now();
+    let url = peer.url.clone();
+    let message = format!("mesh ping from {}", state.node_id);
+    let result = tokio::task::spawn_blocking(move || {
+        post_peer_ping(&url, &serde_json::json!({ "message": message }).to_string())
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": format!("peer_task_failed: {error}") })),
+        )
+    })?;
 
-async fn upsert_scene_layer(
-    State(state): State<Arc<AppState>>,
-    Json(layer): Json<SceneLayer>,
-) -> Result<Json<SceneStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    if layer.layer_id.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "layer_id_required" })),
-        ));
+    let mut next_peer = peer;
+    match result {
+        Ok(()) => {
+            next_peer.status = "online".to_string();
+            next_peer.last_seen = Some(now_rfc3339());
+            next_peer.latency_ms = Some(started.elapsed().as_millis());
+        }
+        Err(error) => {
+            next_peer.status = format!("offline: {error}");
+            next_peer.latency_ms = None;
+        }
     }
 
-    let scene_state = {
-        let mut scene_state = state.scene_state.write().await;
-        if let Some(existing) = scene_state
-            .layers
-            .iter_mut()
-            .find(|candidate| candidate.layer_id == layer.layer_id)
-        {
-            *existing = layer;
-        } else {
-            scene_state.layers.push(layer);
-        }
-        scene_state.clone()
-    };
+    {
+        let mut peers = state.mesh_peers.write().await;
+        peers.insert(next_peer.id.clone(), next_peer.clone());
+    }
 
-    emit_scene_state(state.as_ref(), &scene_state);
-    Ok(Json(SceneStateResponse {
-        ok: true,
-        scene_state,
+    Ok(Json(MeshPeerResponse {
+        ok: next_peer.status == "online",
+        node_id: state.node_id.clone(),
+        peer: next_peer,
     }))
 }
 
-async fn remove_scene_layer(
-    State(state): State<Arc<AppState>>,
-    Path(layer_id): Path<String>,
-) -> Json<SceneStateResponse> {
-    let scene_state = {
-        let mut scene_state = state.scene_state.write().await;
-        scene_state
-            .layers
-            .retain(|layer| layer.layer_id != layer_id);
-        scene_state.clone()
+fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| "only_http_supported_in_mesh_v0".to_string())?;
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (rest, "/".to_string()),
     };
-    emit_scene_state(state.as_ref(), &scene_state);
-    Json(SceneStateResponse {
-        ok: true,
-        scene_state,
-    })
+    if authority.trim().is_empty() {
+        return Err("missing_host".to_string());
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            let parsed_port = port.parse::<u16>().map_err(|_| "invalid_port".to_string())?;
+            (host.to_string(), parsed_port)
+        }
+        None => (authority.to_string(), 80),
+    };
+    Ok((host, port, path))
+}
+
+fn post_peer_ping(base_url: &str, body: &str) -> Result<(), String> {
+    let (host, port, base_path) = parse_http_url(base_url)?;
+    let path = if base_path == "/" {
+        "/v1/ping".to_string()
+    } else {
+        format!("{}/v1/ping", base_path.trim_end_matches('/'))
+    };
+    let mut stream = std::net::TcpStream::connect((host.as_str(), port))
+        .map_err(|error| format!("connect_failed: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .map_err(|error| format!("read_timeout_failed: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(4)))
+        .map_err(|error| format!("write_timeout_failed: {error}"))?;
+
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("write_failed: {error}"))?;
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|error| format!("read_failed: {error}"))?;
+    if response.starts_with("HTTP/1.1 2") || response.starts_with("HTTP/1.0 2") {
+        Ok(())
+    } else {
+        let status = response.lines().next().unwrap_or("empty_response");
+        Err(format!("peer_http_error: {status}"))
+    }
 }
 
 async fn get_scene_state(State(state): State<Arc<AppState>>) -> Json<SceneStateResponse> {
@@ -813,21 +556,12 @@ async fn update_scene_state(
         scene_state.clone()
     };
 
-    emit_scene_state(state.as_ref(), &scene_state);
-
-    Ok(Json(SceneStateResponse {
-        ok: true,
-        scene_state,
-    }))
-}
-
-fn emit_scene_state(state: &AppState, scene_state: &SceneStateModel) {
     let env = Envelope {
         version: "1".to_string(),
         kind: "scene.state.updated".to_string(),
         request_id: Uuid::new_v4(),
         timestamp: now_rfc3339(),
-        source: "master-program".to_string(),
+        source: "master_program".to_string(),
         capability: "scene-control".to_string(),
         payload: serde_json::json!({
             "sceneState": scene_state,
@@ -835,6 +569,11 @@ fn emit_scene_state(state: &AppState, scene_state: &SceneStateModel) {
     };
 
     let _ = state.events_tx.send(env);
+
+    Ok(Json(SceneStateResponse {
+        ok: true,
+        scene_state,
+    }))
 }
 
 fn validate_dist_dir(dist_dir: &FsPath) -> Result<(PathBuf, PathBuf), String> {
@@ -930,7 +669,7 @@ async fn app_asset(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     // Some static middleware expects a Host header; keep it minimal.
     req.headers_mut()
-        .insert("Host", HeaderValue::from_static("master-program"));
+        .insert("Host", HeaderValue::from_static("master_program"));
 
     svc.oneshot(req).await.map_err(|_| StatusCode::NOT_FOUND)
 }
@@ -945,8 +684,8 @@ async fn events(
             match rx.recv().await {
                 Ok(envelope) => {
                     if let Ok(json) = serde_json::to_string(&envelope) {
-                        let evt = if envelope.kind.starts_with("core.ping.") {
-                            Event::default().event(envelope.kind.clone()).data(json)
+                        let evt = if envelope.kind == "core.ping.received" {
+                            Event::default().event("core.ping.received").data(json)
                         } else if envelope.kind == "scene.state.updated" {
                             Event::default().event("scene.state.updated").data(json)
                         } else {
@@ -996,22 +735,15 @@ async fn main() {
         .init();
 
     let (events_tx, _events_rx) = broadcast::channel::<Envelope>(256);
-    let node_id = std::env::var("MASTER_PROGRAM_NODE_ID")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| format!("node-{}", Uuid::new_v4()));
-    let mesh = MeshEngine::new(node_id, Some("master-program".to_string()));
-    mesh.register_transport(Arc::new(LocalHttpTransport));
-    mesh.register_transport(Arc::new(StubTransport::web_rtc()));
-    mesh.register_transport(Arc::new(StubTransport::bluetooth()));
-    mesh.register_transport(Arc::new(StubTransport::serial()));
-    mesh.register_transport(Arc::new(StubTransport::store_forward()));
-
     let state = Arc::new(AppState {
         events_tx,
         started_at: OffsetDateTime::now_utc(),
-        mesh,
+        node_id: std::env::var("MASTER_PROGRAM_NODE_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("node-{}", Uuid::new_v4())),
         apps: RwLock::new(HashMap::new()),
+        mesh_peers: RwLock::new(HashMap::new()),
         scene_state: RwLock::new(SceneStateModel::default()),
     });
 
@@ -1021,16 +753,12 @@ async fn main() {
         .route("/v1/ping", post(ping))
         .route("/v1/mesh/node", get(mesh_node))
         .route("/v1/mesh/peers", get(list_mesh_peers))
-        .route("/v1/mesh/connect", post(connect_mesh_peer))
         .route("/v1/mesh/peers/register", post(register_mesh_peer))
         .route("/v1/mesh/peers/{id}/ping", post(ping_mesh_peer))
-        .route("/v1/mesh/envelope", post(receive_mesh_envelope))
         .route(
             "/v1/scene-state",
             get(get_scene_state).post(update_scene_state),
         )
-        .route("/v1/scene-layers", post(upsert_scene_layer))
-        .route("/v1/scene-layers/{id}", delete(remove_scene_layer))
         .route("/v1/events", get(events_with_headers))
         .route("/v1/apps", get(list_apps))
         .route("/v1/apps/register", post(register_app))
@@ -1043,6 +771,7 @@ async fn main() {
     let port = std::env::var("MASTER_PROGRAM_PORT")
         .ok()
         .and_then(|v| v.parse::<u16>().ok())
+        // Own port — 1421 is the frontend server's (vite/dist); keep them separate.
         .unwrap_or(17321);
 
     let host = std::env::var("MASTER_PROGRAM_HOST")
@@ -1060,7 +789,7 @@ async fn main() {
         }
     };
 
-    tracing::info!("master-program listening on http://{addr}");
+    tracing::info!("master_program listening on http://{addr}");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async {

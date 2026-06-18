@@ -1,7 +1,13 @@
 [package]
-name = "master_program"
+name = "master-program"
 version = "0.1.0"
 edition = "2024"
+
+# Binary name is underscore (master_program) so the levelup autostart finds it at
+# master-program/target/{debug,release}/master_program. Package/folder stay hyphenated.
+[[bin]]
+name = "master_program"
+path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
